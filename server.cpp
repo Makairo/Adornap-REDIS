@@ -13,7 +13,40 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 // C++
+#include <string>
 #include <vector>
+#include <map>
+
+
+/*
+//////////////////////////////////
+CONSTANTS AND OBJECT DECLARATIONS
+//////////////////////////////////
+*/
+
+const size_t k_max_msg = 32 << 20; //33,554,432 bytes. should be larger than will be needed.
+const size_t k_max_args = 200 * 1000; //
+static std::map<std::string, std::string> g_data;
+
+//Res status
+enum
+{
+    RES_OK  = 0,
+    RES_ERR = 1,
+    RES_NX  = 2,
+};
+
+struct Response
+{
+    uint32_t status = 0;
+    std::vector<uint8_t> data;
+};
+
+/*
+//////////////////////////////////
+FUNCTION DECLARATIONS
+//////////////////////////////////
+*/
 
 static void msg(const char *msg)
 {
@@ -51,12 +84,11 @@ static void fd_set_nb(int fd)
     }
 }
 
-const size_t k_max_msg = 32 << 20; //33,554,432 bytes. Larger than will be needed.
-
 struct Conn
 {
     int fd = -1;
 
+    //Intent flags.
     bool want_read = false;
     bool want_write = false;
     bool want_close = false;
@@ -77,6 +109,7 @@ static void buf_remove(std::vector<uint8_t> &buf, size_t n)
     buf.erase(buf.begin(), buf.begin() + n);
 }
 
+// Callback when listening socket is ready
 static Conn *handle_accept(int fd)
 {
     struct sockaddr_in client_addr = {};
@@ -93,12 +126,93 @@ static Conn *handle_accept(int fd)
             ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
             ntohs(client_addr.sin_port));
 
+    // set conn fd to nonblocking mode
     fd_set_nb(connfd);
 
+    // new conn
     Conn *conn = new Conn();
     conn->fd = connfd;
     conn->want_read = true;
     return conn;
+}
+
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t out)
+{
+    if(cur + 4 > end) return false;
+    memcpy(&out, cur, 4);
+    cur += 4;
+    return true;
+}
+
+static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out)
+{
+    if(cur + n > end) return false;
+    out.assign(cur, cur + n);
+    cur += n;
+    return true;
+}
+
+// Parse in a single request.
+static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out)
+{
+    const uint8_t *end = data + size;
+    uint32_t nstr = 0;
+
+    //Safety checks.
+    if(!read_u32(data, end, nstr)) return -1;
+    if(nstr > k_max_args) return -1;
+
+    while(out.size() < nstr)
+    {
+        uint32_t len = 0;
+        if(!read_u32(data, end, len)) return -1;
+
+        out.push_back(std::string());
+        if(!read_str(data, end, len, out.back())) return -1;
+    }
+
+    //Trailing garbage.
+    if(data != end) return -1;
+    //success.
+    return 0;
+
+}
+
+//Process a single request.
+static void do_request(std::vector<std::string> &cmd, Response &out)
+{
+    if(cmd.size() == 2 && cmd[0] == "get")
+    {
+        auto it = g_data.find(cmd[1]);
+        if(it == g_data.end())
+        {
+            out.status = RES_NX;
+            return;
+        }
+
+        const std::string &val = it->second;
+        out.data.assign(val.begin(), val.end());
+    }
+    else if(cmd.size() == 3 && cmd[0] == "set")
+    {
+        g_data[cmd[1]].swap(cmd[2]);
+    }
+    else if(cmd.size() == 2 && cmd[0] == "del")
+    {
+        g_data.erase(cmd[1]);
+    }
+    else
+    {
+        out.status = RES_ERR; // Unknown cmd
+    }
+}
+
+static void make_response(const Response &resp, std::vector<uint8_t> &out)
+{
+    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
+    buf_append(out, (const uint8_t *)&resp_len, 4);
+    buf_append(out, (const uint8_t *)&resp.status, 4);
+    buf_append(out, resp.data.data(), resp.data.size());
 }
 
 // Try to process 1 request from the queue
@@ -128,16 +242,26 @@ static bool try_one_request(Conn *conn)
 
     const uint8_t *request = &conn->incoming[4];
 
-    printf("Client says: len:%d data:%.*s\n", len, len < 100 ? len: 100, request);
+    //Got a request
+    std::vector<std::string> cmd;
+    if(parse_req(request, len, cmd) < 0)
+    {
+        msg("bad request");
+        conn->want_close = true;
+        return false;
+    }
 
-    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
-    buf_append(conn->outgoing, request, len);
+    Response resp;
+    do_request(cmd, resp);
+    make_response(resp, conn->outgoing);
 
+    //Logic complete. Remove the request msg.
     buf_remove(conn->incoming, 4 + len);
 
     return true;
 }
 
+// Callback when socket is writeable.
 static void handle_write(Conn *conn)
 {
     assert(conn->outgoing.size() > 0);
@@ -162,6 +286,7 @@ static void handle_write(Conn *conn)
     }
 }
 
+// Callback when socket is readable.
 static void handle_read(Conn *conn)
 {
     uint8_t buf[64 * 1024];
@@ -204,6 +329,12 @@ static void handle_read(Conn *conn)
     }
 }
 
+/*
+//////////////////////////////////
+MAIN LOGIC
+//////////////////////////////////
+*/
+
 int main()
 {
     //Socket syscall takes in 3 args.
@@ -236,6 +367,9 @@ int main()
         die("bind()");
     }
 
+    // set the listen fd to nonblocking mode
+    fd_set_nb(fd);
+
     // Listening for Connections
     rv = listen(fd, SOMAXCONN); // SOMAXCONN is the maximum length for the queue of pending connections.
     if(rv) 
@@ -248,17 +382,21 @@ int main()
 
     std::vector<struct pollfd> poll_args;
 
+    // Event loop
     while(true)
     {
+        //prepare args of poll(), move the listening sockets to first position.
         poll_args.clear();
 
         struct pollfd pfd = {fd, POLLIN, 0};
         poll_args.push_back(pfd);
 
+        // connection sockets
         for(Conn *conn : fd2conn)
         {
             if(!conn) continue;
-
+            
+            //poll() for error, then poll() flags from the apps intent.
             struct pollfd pfd = {conn->fd, POLLERR, 0};
 
             if(conn->want_read)
@@ -288,6 +426,7 @@ int main()
         {
             if(Conn *conn = handle_accept(fd))
             {
+                // put conn into the map.
                 if(fd2conn.size() <= (size_t)conn->fd)
                 {
                     fd2conn.resize(conn->fd + 1);
@@ -298,21 +437,18 @@ int main()
         }
 
         // Handle connection sockets
-        for(size_t i = 1 ; i < poll_args.size() ; ++i)
+        for(size_t i = 1 ; i < poll_args.size() ; ++i) //skip first
         {
             uint32_t ready = poll_args[i].revents;
-            if(ready == 0)
-            {
-                continue;
-            }
+            if(ready == 0) continue;
 
             Conn *conn = fd2conn[poll_args[i].fd];
-
             if(ready & POLLIN)
             {
                 assert(conn->want_read);
                 handle_read(conn);
             }
+
             if(ready & POLLOUT)
             {
                 assert(conn ->want_write);
