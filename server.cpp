@@ -16,7 +16,11 @@
 #include <string>
 #include <vector>
 #include <map>
+// Project Lib
+#include "hashtable.h"
 
+#define container_of(ptr, T, member) \
+    ((T *)((char *)ptr - offsetof(T, member)))
 
 /*
 //////////////////////////////////
@@ -26,7 +30,20 @@ CONSTANTS AND OBJECT DECLARATIONS
 
 const size_t k_max_msg = 32 << 20; //33,554,432 bytes. should be larger than will be needed.
 const size_t k_max_args = 200 * 1000; //
-static std::map<std::string, std::string> g_data;
+
+struct Conn
+{
+    int fd = -1;
+
+    //Intent flags.
+    bool want_read = false;
+    bool want_write = false;
+    bool want_close = false;
+
+    std::vector<uint8_t> incoming; // data to be parsed
+    std::vector<uint8_t> outgoing; // data to be sent
+};
+
 
 //Res status
 enum
@@ -42,28 +59,54 @@ struct Response
     std::vector<uint8_t> data;
 };
 
+//Top level hashtable
+static struct 
+{
+    HMap db; 
+} g_data;
+
+// KV pair for the HT above
+struct Entry
+{
+    struct HNode node;
+    std::string key;
+    std::string val;
+};
+
 /*
 //////////////////////////////////
 FUNCTION DECLARATIONS
 //////////////////////////////////
 */
 
+// IN : const char *msg
+// OUT : none
+// DESC: Print a message to stderr
 static void msg(const char *msg)
 {
     fprintf(stderr, "%s\n", msg);
 }
 
+// IN : const char *msg
+// OUT : none
+// DESC: Print a message to stderr including the current errno
 static void msg_errno(const char *msg)
 {
     fprintf(stderr, "[errno:%d] %s\n", errno, msg);
 }
 
+// IN : const char *msg
+// OUT : none
+// DESC: Print an error message with errno and abort the program
 static void die(const char *msg)
 {
     fprintf(stderr, "[%d] %s\n", errno, msg);
     abort();
 }
 
+// IN : int fd
+// OUT : none
+// DESC: Set the given file descriptor to non-blocking mode
 static void fd_set_nb(int fd)
 {
     errno = 0;
@@ -84,32 +127,108 @@ static void fd_set_nb(int fd)
     }
 }
 
-struct Conn
+// IN : HNode *lhs, HNode *rhs
+// OUT : bool
+// DESC: Compare two Entry nodes by their key for equality
+static bool entry_eq(HNode *lhs, HNode *rhs)
 {
-    int fd = -1;
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
 
-    //Intent flags.
-    bool want_read = false;
-    bool want_write = false;
-    bool want_close = false;
+// IN : const uint8_t *data, size_t len
+// OUT : uint64_t hash value
+// DESC: Compute FNV hash of a byte array
+static uint64_t str_hash(const uint8_t *data, size_t len)
+{
+    uint32_t h = 0x811C9DC5;
+    for(size_t i = 0 ; i < len ; i++)
+    {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
 
-    std::vector<uint8_t> incoming; // data to be parsed
-    std::vector<uint8_t> outgoing; // data to be sent
-};
+// IN : std::vector<std::string> &cmd, Response &out
+// OUT : Response is updated with the value if key exists, or status=RES_NX if not found
+// DESC: Handle a "get" command by looking up the key in the hash table
+static void do_get(std::vector<std::string> &cmd, Response &out)
+{
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-//append to back of buffer
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if(!node)
+    {
+        out.status = RES_NX;
+        return;
+    }
+
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    out.data.assign(val.begin(), val.end());
+}
+
+// IN : std::vector<std::string> &cmd, Response &out
+// OUT : Response is updated indirectly by updating the HT
+// DESC: Handle a "set" command by inserting or updating the key-value pair in the hash table
+static void do_set(std::vector<std::string> &cmd, Response &)
+{
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) 
+    {
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    } 
+    else 
+    {
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+}
+
+// IN : std::vector<std::string> &cmd, Response &out
+// OUT : Response is updated indirectly by removing the key from the hash table
+// DESC: Handle a "del" command by deleting the key-value pair from the hash table
+static void do_del(std::vector<std::string> &cmd, Response &)
+{
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        delete container_of(node, Entry, node);
+    }
+}
+
+// IN : std::vector<uint8_t> &buf, const uint8_t *data, size_t len
+// OUT : buf is appended with the new data
+// DESC: Append a byte array to the end of a buffer
 static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len)
 {
     buf.insert(buf.end(), data, data + len);
 }
 
-//remove from front of buffer
+// IN : std::vector<uint8_t> &buf, size_t n
+// OUT : buf has the first n bytes removed
+// DESC: Remove the first n bytes from a buffer
 static void buf_remove(std::vector<uint8_t> &buf, size_t n)
 {
     buf.erase(buf.begin(), buf.begin() + n);
 }
 
-// Callback when listening socket is ready
+// IN : int fd
+// OUT : Conn * for the new client, or NULL on failure
+// DESC: Accept a new connection on the listening socket and initialize a Conn struct
 static Conn *handle_accept(int fd)
 {
     struct sockaddr_in client_addr = {};
@@ -126,16 +245,17 @@ static Conn *handle_accept(int fd)
             ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
             ntohs(client_addr.sin_port));
 
-    // set conn fd to nonblocking mode
     fd_set_nb(connfd);
 
-    // new conn
     Conn *conn = new Conn();
     conn->fd = connfd;
     conn->want_read = true;
     return conn;
 }
 
+// IN : const uint8_t *&cur, const uint8_t *end, uint32_t out
+// OUT : bool indicating success, out updated
+// DESC: Read a 32-bit unsigned integer from the buffer and advance the pointer
 static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t out)
 {
     if(cur + 4 > end) return false;
@@ -144,6 +264,9 @@ static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t out)
     return true;
 }
 
+// IN : const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out
+// OUT : bool indicating success, out updated
+// DESC: Read n bytes from buffer into a string and advance the pointer
 static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out)
 {
     if(cur + n > end) return false;
@@ -152,13 +275,14 @@ static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::str
     return true;
 }
 
-// Parse in a single request.
+// IN : const uint8_t *data, size_t size, std::vector<std::string> &out
+// OUT : returns 0 on success, -1 on failure; out populated with parsed strings
+// DESC: Parse a request message into individual string arguments
 static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out)
 {
     const uint8_t *end = data + size;
     uint32_t nstr = 0;
 
-    //Safety checks.
     if(!read_u32(data, end, nstr)) return -1;
     if(nstr > k_max_args) return -1;
 
@@ -171,42 +295,36 @@ static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::stri
         if(!read_str(data, end, len, out.back())) return -1;
     }
 
-    //Trailing garbage.
     if(data != end) return -1;
-    //success.
     return 0;
-
 }
 
-//Process a single request.
+// IN : std::vector<std::string> &cmd, Response &out
+// OUT : Response updated according to command
+// DESC: Dispatch a parsed request to the appropriate handler (get/set/del)
 static void do_request(std::vector<std::string> &cmd, Response &out)
 {
     if(cmd.size() == 2 && cmd[0] == "get")
     {
-        auto it = g_data.find(cmd[1]);
-        if(it == g_data.end())
-        {
-            out.status = RES_NX;
-            return;
-        }
-
-        const std::string &val = it->second;
-        out.data.assign(val.begin(), val.end());
+        return do_get(cmd, out);
     }
     else if(cmd.size() == 3 && cmd[0] == "set")
     {
-        g_data[cmd[1]].swap(cmd[2]);
+        return do_set(cmd, out);
     }
     else if(cmd.size() == 2 && cmd[0] == "del")
     {
-        g_data.erase(cmd[1]);
+        return do_del(cmd, out);
     }
     else
     {
-        out.status = RES_ERR; // Unknown cmd
+        out.status = RES_ERR;
     }
 }
 
+// IN : const Response &resp, std::vector<uint8_t> &out
+// OUT : out buffer contains serialized response
+// DESC: Convert Response struct into a byte buffer to send to client
 static void make_response(const Response &resp, std::vector<uint8_t> &out)
 {
     uint32_t resp_len = 4 + (uint32_t)resp.data.size();
@@ -215,12 +333,14 @@ static void make_response(const Response &resp, std::vector<uint8_t> &out)
     buf_append(out, resp.data.data(), resp.data.size());
 }
 
-// Try to process 1 request from the queue
+// IN : Conn *conn
+// OUT : returns true if a request was processed; updates conn buffers and Response
+// DESC: Try to process one complete request from the connection buffer
 static bool try_one_request(Conn *conn)
 {
     if(conn->incoming.size() < 4)
     {
-        return false; // want read
+        return false;
     }
 
     uint32_t len = 0;
@@ -230,19 +350,16 @@ static bool try_one_request(Conn *conn)
     {
         msg("MSG too long.");
         conn->want_close = true;
-        return false; // want close
+        return false;
     }
 
-
-    // msg body
     if(4 + len > conn->incoming.size())
     {
-        return false; // want read
+        return false;
     }
 
     const uint8_t *request = &conn->incoming[4];
 
-    //Got a request
     std::vector<std::string> cmd;
     if(parse_req(request, len, cmd) < 0)
     {
@@ -255,20 +372,21 @@ static bool try_one_request(Conn *conn)
     do_request(cmd, resp);
     make_response(resp, conn->outgoing);
 
-    //Logic complete. Remove the request msg.
     buf_remove(conn->incoming, 4 + len);
 
     return true;
 }
 
-// Callback when socket is writeable.
+// IN : Conn *conn
+// OUT : updates conn->outgoing buffer and intent flags
+// DESC: Write buffered data to the client socket
 static void handle_write(Conn *conn)
 {
     assert(conn->outgoing.size() > 0);
     ssize_t rv = write(conn->fd, &conn->outgoing[0], conn->outgoing.size());
     if(rv < 0 && errno == EAGAIN)
     {
-        return; // Not ready to write.
+        return;
     }
     if(rv < 0)
     {
@@ -279,21 +397,23 @@ static void handle_write(Conn *conn)
 
     buf_remove(conn->outgoing, (size_t)rv);
 
-    if(conn->outgoing.size() == 0) // All data in buffer is written. Else we still want to write.
+    if(conn->outgoing.size() == 0)
     {
         conn->want_read = true;
         conn->want_write = false;
     }
 }
 
-// Callback when socket is readable.
+// IN : Conn *conn
+// OUT : updates conn->incoming buffer and intent flags
+// DESC: Read data from the client socket, append to buffer, and process requests
 static void handle_read(Conn *conn)
 {
     uint8_t buf[64 * 1024];
     ssize_t rv = read(conn->fd, buf, sizeof(buf));
     if(rv < 0 && errno == EAGAIN)
     {
-        return; // not ready to read
+        return;
     }
 
     if(rv < 0)
@@ -303,25 +423,23 @@ static void handle_read(Conn *conn)
         return;
     }
 
-    if(rv == 0) // EOF
+    if(rv == 0)
     {
         if(conn->incoming.size() == 0)
         {
             msg("Client closed.");
-        }else{
+        } else {
             msg("Unexpected EOF.");
         }
-        conn->want_close = true; // want close. 
+        conn->want_close = true;
         return;
     }
 
-    // got some new data
     buf_append(conn->incoming, buf, (size_t)rv);
 
-    // Keep processing requests
     while(try_one_request(conn)) {}
 
-    if(conn->outgoing.size() > 0)   // Has a res
+    if(conn->outgoing.size() > 0)
     {
         conn->want_read = false;
         conn->want_write = true;
