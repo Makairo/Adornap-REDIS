@@ -1,13 +1,13 @@
-# 🔴 Adornap-REDIS
+# Adornap-REDIS
 
 **Adornap-REDIS** is a *work-in-progress* Redis-inspired key-value server written in **C++** running on a Linux (WSL) environment.
 
 This project is being built following the excellent guide at  
-👉 https://build-your-own.org/redis/#table-of-contents — which teaches how to build a Redis server from scratch in C/C++. 
+https://build-your-own.org/redis/#table-of-contents — which teaches how to build a Redis server from scratch in C/C++. 
 
 ---
 
-## 🧩 Overview
+## Overview
 
 Adornap-REDIS aims to replicate and explore the internals of an in-memory key-value store similar to the open-source Redis server — but built from scratch as a learning and engineering exercise.
 
@@ -24,7 +24,7 @@ This project is not a full Redis implementation yet — it’s designed to teach
 
 ---
 
-## 🧠 Why Build This?
+## Why Build This?
 
 Redis is one of the most influential backend infrastructure components in modern systems — used for caching, message brokering, analytics, and more. Understanding how it works from scratch gives you:
 
@@ -37,7 +37,7 @@ This is inspired by the *Build Your Own Redis* tutorial which focuses on event l
 
 ---
 
-## 🚀 Current Features
+## Current Features
 
 ✔ Non-blocking server using `poll()`  
 ✔ Custom hash map implementation  
@@ -48,7 +48,7 @@ This is inspired by the *Build Your Own Redis* tutorial which focuses on event l
 
 ---
 
-## 🚀 How to Build
+## How to Build
 
 Make sure you have a C++ compiler installed in your UNIX environment (e.g., `g++`).
 
